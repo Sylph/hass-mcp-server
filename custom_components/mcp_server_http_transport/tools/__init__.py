@@ -160,6 +160,7 @@ from . import (  # noqa: E402
     categories,  # noqa: F401
     config,  # noqa: F401
     config_files,  # noqa: F401
+    config_flows,  # noqa: F401
     dashboards,  # noqa: F401
     entities,  # noqa: F401
     helpers,  # noqa: F401

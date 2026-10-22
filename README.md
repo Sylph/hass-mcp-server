@@ -292,6 +292,12 @@ been copied and source identity/metadata checked for changes during copying.
 | `describe_service` | Get a service's full parameter schema: fields, selectors, examples, and targets |
 | `list_integrations` | List installed integrations and their status |
 | `list_labels` | List all labels for cross-domain grouping |
+| `start_config_flow` | Start an integration's setup flow (add an integration) from its `domain`; returns the `flow_id`, step and form fields (name, type, required, default) |
+| `configure_config_flow` | Submit a step of a setup flow (`flow_id`, `user_input`); returns the next form, field errors such as `cannot_connect`, or the created entry (`entry_id`, `title`, `domain`) |
+| `abort_config_flow` | Abort and discard an unfinished setup flow |
+| `list_config_flows_in_progress` | List setup flows that are started or discovered but not finished |
+
+Setup-flow results never echo secret-looking fields (names containing `password`, `token`, `key`, `secret`, `credential` or `auth`): their defaults and suggested values are masked, and the created entry's data is not returned. Like every tool here, they run with the full rights of the token that authenticated the request.
 
 **KNX**
 
