@@ -5,13 +5,107 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import voluptuous as vol
-from homeassistant import data_entry_flow
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 
 from custom_components.mcp_server_http_transport.http import MCPEndpointView
-from custom_components.mcp_server_http_transport.tools import TOOLS
+from custom_components.mcp_server_http_transport.tools import TOOLS, call_tool
 
 SECRET = "hunter2-very-secret"
+
+
+class _StubFlow(config_entries.ConfigFlow):
+    """A minimal config flow: password-selector field, an error path, a create-entry."""
+
+    VERSION = 1
+
+    async def async_step_user(self, user_input=None):
+        errors = {}
+        if user_input is not None:
+            if user_input["host"] == "bad":
+                errors["base"] = "cannot_connect"
+            else:
+                return self.async_create_entry(title=user_input["host"], data=user_input)
+        schema = vol.Schema(
+            {
+                vol.Required("host"): str,
+                vol.Required("pin", default="1234"): TextSelector(
+                    TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                ),
+            }
+        )
+        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
+
+
+def _out(result):
+    return json.loads(result["content"][0]["text"])
+
+
+async def test_real_flow_manager_end_to_end(hass):
+    """Drive Home Assistant's real FlowManager through the tools."""
+    from pytest_homeassistant_custom_component.common import (
+        MockModule,
+        mock_config_flow,
+        mock_integration,
+        mock_platform,
+    )
+
+    mock_integration(
+        hass,
+        MockModule(
+            "stubdomain",
+            async_setup_entry=AsyncMock(return_value=True),
+            partial_manifest={"config_flow": True},
+        ),
+    )
+    mock_platform(hass, "stubdomain.config_flow", None)
+    with mock_config_flow("stubdomain", _StubFlow):
+        started = _out(await call_tool(hass, "start_config_flow", {"domain": "stubdomain"}))
+        assert started["type"] == "form"
+        fields = {f["name"]: f for f in started["data_schema"]}
+        assert fields["pin"]["default"] == "***"
+        flow_id = started["flow_id"]
+
+        listed = _out(await call_tool(hass, "list_config_flows_in_progress", {}))
+        assert listed[0]["flow_id"] == flow_id and listed[0]["source"] == "user"
+
+        # The real manager rejects input that does not match the schema (extra key).
+        rejected = _out(
+            await call_tool(
+                hass,
+                "configure_config_flow",
+                {"flow_id": flow_id, "user_input": {"host": "h", "pin": SECRET, "x": 1}},
+            )
+        )
+        assert "error" in rejected and SECRET not in json.dumps(rejected)
+
+        failed = _out(
+            await call_tool(
+                hass,
+                "configure_config_flow",
+                {"flow_id": flow_id, "user_input": {"host": "bad", "pin": SECRET}},
+            )
+        )
+        assert failed["errors"] == {"base": "cannot_connect"}
+        assert SECRET not in json.dumps(failed)
+
+        created = _out(
+            await call_tool(
+                hass,
+                "configure_config_flow",
+                {"flow_id": flow_id, "user_input": {"host": "good", "pin": SECRET}},
+            )
+        )
+        assert created["type"] == "create_entry"
+        assert created["entry"]["domain"] == "stubdomain"
+        assert created["entry"]["title"] == "good"
+        assert created["entry"]["entry_id"]
+        assert SECRET not in json.dumps(created)
 
 
 class TestToolsConfigFlows:
@@ -23,6 +117,7 @@ class TestToolsConfigFlows:
         hass = Mock()
         hass.config_entries = Mock()
         hass.config_entries.flow = Mock()
+        hass.config_entries.flow.async_progress.return_value = []
         return hass
 
     @pytest.fixture
@@ -94,7 +189,7 @@ class TestToolsConfigFlows:
         assert fields["port"]["type"] == "integer"
         assert fields["api_key"]["required"] is False
 
-    async def test_start_passes_source(self, view, mock_hass):
+    async def test_start_always_uses_user_source(self, view, mock_hass):
         mock_hass.config_entries.flow.async_init = AsyncMock(
             return_value={"type": FlowResultType.ABORT, "reason": "single_instance_allowed"}
         )
@@ -104,9 +199,80 @@ class TestToolsConfigFlows:
         )
 
         mock_hass.config_entries.flow.async_init.assert_awaited_once_with(
-            "moonraker", context={"source": "import"}
+            "moonraker", context={"source": "user"}
         )
-        assert data == {"type": "abort", "reason": "single_instance_allowed"}
+        assert data == {"type": "abort", "reason": "single_instance_allowed", "source": "user"}
+        assert "source" not in TOOLS["start_config_flow"]["schema"]["inputSchema"]["properties"]
+
+    async def test_start_unexpected_error_reports_only_type(self, view, mock_hass):
+        mock_hass.config_entries.flow.async_init = AsyncMock(
+            side_effect=RuntimeError("https://x/?token=" + SECRET)
+        )
+
+        text, data = await self._call(view, "start_config_flow", {"domain": "x"})
+
+        assert data == {"error": "RuntimeError"}
+        assert SECRET not in text
+
+    async def test_configure_unexpected_error_reports_only_type(self, view, mock_hass):
+        mock_hass.config_entries.flow.async_configure = AsyncMock(
+            side_effect=RuntimeError("https://x/?token=" + SECRET)
+        )
+
+        text, data = await self._call(view, "configure_config_flow", {"flow_id": "f"})
+
+        assert data == {"error": "RuntimeError"}
+        assert SECRET not in text
+
+    async def test_start_masks_password_selector_field(self, view, mock_hass):
+        schema = vol.Schema(
+            {
+                vol.Required("pin", default="1234"): TextSelector(
+                    TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                ),
+                vol.Optional("name", default="visible"): str,
+            }
+        )
+        mock_hass.config_entries.flow.async_init = AsyncMock(return_value=self._form(schema))
+
+        text, data = await self._call(view, "start_config_flow", {"domain": "x"})
+
+        fields = {f["name"]: f for f in data["data_schema"]}
+        assert fields["pin"]["default"] == "***"
+        assert fields["name"]["default"] == "visible"
+        assert "1234" not in text
+
+    async def test_placeholder_urls_lose_userinfo_and_query(self, view, mock_hass):
+        mock_hass.config_entries.flow.async_configure = AsyncMock(
+            return_value={
+                "type": FlowResultType.ABORT,
+                "reason": "x",
+                "description_placeholders": {"url": f"http://u:{SECRET}@host:80/p?t={SECRET}#f"},
+            }
+        )
+
+        text, data = await self._call(view, "configure_config_flow", {"flow_id": "f"})
+
+        assert data["description_placeholders"] == {"url": "http://host:80/p"}
+        assert SECRET not in text
+
+    @pytest.mark.parametrize("source", ["reauth", "reconfigure"])
+    async def test_configure_and_abort_refuse_existing_entry_flows(self, view, mock_hass, source):
+        mock_hass.config_entries.flow.async_progress.return_value = [
+            {"flow_id": "f1", "handler": "x", "context": {"source": source}}
+        ]
+        mock_hass.config_entries.flow.async_configure = AsyncMock()
+
+        _, configured = await self._call(view, "configure_config_flow", {"flow_id": "f1"})
+        _, aborted = await self._call(view, "abort_config_flow", {"flow_id": "f1"})
+
+        assert source in configured["error"]
+        assert source in aborted["error"]
+        mock_hass.config_entries.flow.async_configure.assert_not_awaited()
+        mock_hass.config_entries.flow.async_abort.assert_not_called()
+
+    def test_abort_is_marked_destructive(self):
+        assert TOOLS["abort_config_flow"]["schema"]["annotations"]["destructiveHint"] is True
 
     async def test_start_unknown_domain(self, view, mock_hass):
         mock_hass.config_entries.flow.async_init = AsyncMock(

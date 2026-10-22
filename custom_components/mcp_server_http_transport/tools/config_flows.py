@@ -3,14 +3,16 @@
 import logging
 import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import voluptuous as vol
 import voluptuous_serialize
-from homeassistant import data_entry_flow
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 
 from . import (
+    ANNOTATION_DESTRUCTIVE,
     ANNOTATION_NON_IDEMPOTENT,
     ANNOTATION_READ_ONLY,
     dumps,
@@ -33,13 +35,36 @@ def _is_secret(name: Any) -> bool:
     return isinstance(name, str) and _SECRET_NAME.search(name) is not None
 
 
+def _is_secret_field(field: dict[str, Any]) -> bool:
+    """Return True if a serialized form field is secret by name or by password selector."""
+    selector = field.get("selector")
+    text = selector.get("text") if isinstance(selector, dict) else None
+    if isinstance(text, dict) and str(getattr(text.get("type"), "value", text.get("type"))) == (
+        "password"
+    ):
+        return True
+    return _is_secret(field.get("name"))
+
+
+def _strip_url(value: Any) -> Any:
+    """Drop userinfo, query string and fragment from a URL-like string."""
+    if not isinstance(value, str) or "://" not in value:
+        return value
+    try:
+        parts = urlsplit(value)
+        host = parts.netloc.rpartition("@")[2]
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except ValueError:
+        return REDACTED
+
+
 def _redact(value: Any) -> Any:
     """Return value with the content of any secret-looking key replaced."""
     if isinstance(value, dict):
         return {k: (REDACTED if _is_secret(k) else _redact(v)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact(item) for item in value]
-    return value
+    return _strip_url(value)
 
 
 def _serialize_schema(schema: Any) -> list[dict[str, Any]]:
@@ -51,7 +76,7 @@ def _serialize_schema(schema: Any) -> list[dict[str, Any]]:
         return [{"error": "form schema could not be described"}]
 
     for field in fields:
-        if not _is_secret(field.get("name")):
+        if not _is_secret_field(field):
             continue
         if "default" in field:
             field["default"] = REDACTED
@@ -61,12 +86,14 @@ def _serialize_schema(schema: Any) -> list[dict[str, Any]]:
     return fields
 
 
-def _flow_result(result: dict[str, Any]) -> dict[str, Any]:
+def _flow_result(result: dict[str, Any], source: str | None = None) -> dict[str, Any]:
     """Reduce a config-flow result to a JSON-safe summary with no secret values."""
     out: dict[str, Any] = {"type": str(getattr(result["type"], "value", result["type"]))}
     for key in ("flow_id", "handler", "step_id", "reason", "last_step", "url", "progress_action"):
         if result.get(key) is not None:
             out[key] = result[key]
+    if source:
+        out["source"] = source
     if result.get("errors"):
         out["errors"] = result["errors"]
     if result.get("description_placeholders"):
@@ -84,6 +111,22 @@ def _flow_result(result: dict[str, Any]) -> dict[str, Any]:
             "domain": getattr(entry, "domain", None) or result.get("handler"),
         }
     return out
+
+
+# Reauth and reconfigure flows change an existing entry's credentials or settings.
+_PROTECTED_SOURCES = {config_entries.SOURCE_REAUTH, config_entries.SOURCE_RECONFIGURE}
+
+
+def _flow_source(hass: HomeAssistant, flow_id: str) -> str | None:
+    """Return the source of an in-progress flow, or None if it is not in progress."""
+    for flow in hass.config_entries.flow.async_progress():
+        if flow.get("flow_id") == flow_id:
+            return (flow.get("context") or {}).get("source")
+    return None
+
+
+def _protected_message(source: str) -> str:
+    return f"Flows with source '{source}' change an existing entry and are not driven by this tool"
 
 
 def _text(payload: Any) -> dict[str, Any]:
@@ -109,10 +152,6 @@ def _error(message: str) -> dict[str, Any]:
                 "type": "string",
                 "description": "Integration domain to set up, e.g. 'moonraker'",
             },
-            "source": {
-                "type": "string",
-                "description": "Flow source (default 'user'), e.g. 'user' or 'import'",
-            },
         },
         "required": ["domain"],
     },
@@ -121,14 +160,18 @@ def _error(message: str) -> dict[str, Any]:
 async def start_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) -> dict[str, Any]:
     """Start a config flow for an integration."""
     domain = arguments["domain"]
-    source = arguments.get("source") or "user"
     try:
-        result = await hass.config_entries.flow.async_init(domain, context={"source": source})
+        result = await hass.config_entries.flow.async_init(
+            domain, context={"source": config_entries.SOURCE_USER}
+        )
     except data_entry_flow.UnknownHandler:
         return _error(f"No setup flow exists for integration '{domain}'")
     except data_entry_flow.FlowError as err:
         return _error(f"Could not start setup flow for '{domain}': {err}")
-    return _text(_flow_result(result))
+    except Exception as err:  # noqa: BLE001 - library errors can carry tokenised URLs
+        _LOGGER.debug("Config flow start failed", exc_info=True)
+        return _error(type(err).__name__)
+    return _text(_flow_result(result, config_entries.SOURCE_USER))
 
 
 @register_tool(
@@ -158,6 +201,9 @@ async def configure_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) 
     user_input = arguments.get("user_input")
     if user_input is not None and not isinstance(user_input, dict):
         return _error("user_input must be an object")
+    source = _flow_source(hass, flow_id)
+    if source in _PROTECTED_SOURCES:
+        return _error(_protected_message(source))
     try:
         result = await hass.config_entries.flow.async_configure(flow_id, user_input or {})
     except data_entry_flow.UnknownFlow:
@@ -169,7 +215,10 @@ async def configure_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) 
         return _error(f"user_input does not match the current step's fields: {err}")
     except data_entry_flow.FlowError as err:
         return _error(f"Setup flow failed: {err}")
-    return _text(_flow_result(result))
+    except Exception as err:  # noqa: BLE001 - library errors can carry tokenised URLs
+        _LOGGER.debug("Config flow step failed", exc_info=True)
+        return _error(type(err).__name__)
+    return _text(_flow_result(result, source))
 
 
 @register_tool(
@@ -182,11 +231,14 @@ async def configure_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) 
         },
         "required": ["flow_id"],
     },
-    annotations=ANNOTATION_NON_IDEMPOTENT,
+    annotations=ANNOTATION_DESTRUCTIVE,
 )
 async def abort_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) -> dict[str, Any]:
     """Abort an in-progress config flow."""
     flow_id = arguments["flow_id"]
+    source = _flow_source(hass, flow_id)
+    if source in _PROTECTED_SOURCES:
+        return _error(_protected_message(source))
     try:
         hass.config_entries.flow.async_abort(flow_id)
     except data_entry_flow.UnknownFlow:
