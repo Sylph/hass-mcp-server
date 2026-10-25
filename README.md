@@ -1,5 +1,19 @@
 # MCP Server for Home Assistant (HTTP Transport)
 
+> **This is the `Sylph` fork** of [`ganhammar/hass-mcp-server`](https://github.com/ganhammar/hass-mcp-server).
+> It tracks upstream and adds one thing: **setup-flow tools** (`start_config_flow`, `configure_config_flow`,
+> `abort_config_flow`, `list_config_flows_in_progress`) so an MCP client can add an integration, plus stricter
+> audit-log redaction for them (every value submitted to a setup form is blanked; field names are kept).
+> Everything else is upstream, unchanged.
+>
+> - **Versions** are `<upstream version>-sylph.<n>` (for example `v2.0.1-sylph.1` = upstream v2.0.1 plus these tools).
+> - **Updates:** upstream changes are merged only after a review; releases are built by this repo's
+>   `Create Release` workflow when the manifest version changes on `main`, and carry the zip HACS downloads.
+> - **Install with HACS:** add this repository as a custom repository (type Integration), download the latest
+>   `-sylph` release, restart Home Assistant. Remove an existing install from upstream first; its settings are kept.
+> - The added tools are offered upstream when proven; if upstream adopts them, this fork returns to plain upstream.
+
+
 A Home Assistant Custom Component that provides an MCP (Model Context Protocol) server using **HTTP transport**, allowing AI assistants like Claude to interact with your Home Assistant instance.
 
 **Why HTTP transport with OAuth?** This project was built primarily to support MCP Streamable HTTP transport, enabling web-based clients like Claude that require OIDC and OAuth 2.0 Dynamic Client Registration (RFC 7591). Since Home Assistant already has an [official MCP integration](https://www.home-assistant.io/integrations/mcp_server/) that supports SSE transport, there wasn't a need to duplicate that. For local or custom client setups, Long-Lived Access Token authentication can be enabled as an alternative.
@@ -297,7 +311,7 @@ been copied and source identity/metadata checked for changes during copying.
 | `abort_config_flow` | Abort and discard an unfinished setup flow |
 | `list_config_flows_in_progress` | List setup flows that are started or discovered but not finished |
 
-Setup-flow results never echo secret-looking fields (names containing `password`, `token`, `key`, `secret`, `credential` or `auth`): their defaults and suggested values are masked, and the created entry's data is not returned. Like every tool here, they require a Home Assistant administrator and are audited with the caller's identity. The audit log shows which fields `configure_config_flow` was given but never their values.
+Setup-flow results never echo secret fields: a field counts as secret if its name contains `password`, `token`, `key`, `secret`, `credential` or `auth`, or if it uses a password text selector. Their defaults and suggested values are masked, URLs in a step's description lose any login and query string, and the created entry's data is not returned. Flows always start as a normal user setup (`source: user`); `configure_config_flow` and `abort_config_flow` refuse re-authentication and reconfigure flows, so a client cannot take over a re-login Home Assistant started on its own. Like every tool here, they require a Home Assistant administrator and are audited with the caller's identity. The audit log shows which fields `configure_config_flow` was given but never their values.
 
 **KNX**
 
