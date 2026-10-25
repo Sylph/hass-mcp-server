@@ -3,10 +3,9 @@
 import logging
 import re
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import voluptuous as vol
-import voluptuous_serialize
 from homeassistant import config_entries, data_entry_flow
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
@@ -18,6 +17,12 @@ from . import (
     dumps,
     register_tool,
 )
+from .system_admin import redact_log_text
+
+try:  # Home Assistant 2026.9 and later serialize schemas with probatio
+    from probatio import to_field_list as _to_field_list
+except ImportError:  # earlier releases use voluptuous_serialize
+    from voluptuous_serialize import convert as _to_field_list
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,16 +51,14 @@ def _is_secret_field(field: dict[str, Any]) -> bool:
     return _is_secret(field.get("name"))
 
 
-def _strip_url(value: Any) -> Any:
-    """Drop userinfo, query string and fragment from a URL-like string."""
-    if not isinstance(value, str) or "://" not in value:
-        return value
-    try:
-        parts = urlsplit(value)
-        host = parts.netloc.rpartition("@")[2]
-        return urlunsplit((parts.scheme, host, parts.path, "", ""))
-    except ValueError:
-        return REDACTED
+def _clean_text(text: str) -> str:
+    """Drop the query string and fragment of a URL, then mask credentials in what is left.
+
+    The query goes whole because redact_log_text only knows common parameter names.
+    """
+    if "://" in text:
+        text = urlsplit(text)._replace(query="", fragment="").geturl()
+    return redact_log_text(text)
 
 
 def _redact(value: Any) -> Any:
@@ -64,14 +67,14 @@ def _redact(value: Any) -> Any:
         return {k: (REDACTED if _is_secret(k) else _redact(v)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact(item) for item in value]
-    return _strip_url(value)
+    return _clean_text(value) if isinstance(value, str) else value
 
 
 def _serialize_schema(schema: Any) -> list[dict[str, Any]]:
     """Describe a form's voluptuous schema as a list of fields, without secret values."""
     try:
-        fields = voluptuous_serialize.convert(schema, custom_serializer=cv.custom_serializer)
-    except (ValueError, TypeError, vol.Invalid) as err:
+        fields = _to_field_list(schema, custom_serializer=cv.custom_serializer)
+    except Exception as err:  # noqa: BLE001 - an unusual schema must not fail the call
         _LOGGER.debug("Could not serialize config flow schema: %s", err)
         return [{"error": "form schema could not be described"}]
 

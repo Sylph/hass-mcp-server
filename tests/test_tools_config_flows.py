@@ -13,10 +13,19 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from custom_components.mcp_server_http_transport.http import MCPEndpointView
+from custom_components.mcp_server_http_transport.const import EVENT_TOOL_CALLED
+from custom_components.mcp_server_http_transport.http import (
+    AUTH_METHOD_NATIVE,
+    Caller,
+    MCPEndpointView,
+    ValidatedToken,
+)
 from custom_components.mcp_server_http_transport.tools import TOOLS, call_tool
 
 SECRET = "hunter2-very-secret"
+
+# The view resolves every request to an authorized caller before dispatch.
+CALLER = Caller(user_id="user123", auth_method="native", user=Mock(is_admin=True))
 
 
 class _StubFlow(config_entries.ConfigFlow):
@@ -136,7 +145,7 @@ class TestToolsConfigFlows:
                 "id": 1,
             }
         )
-        with patch.object(view, "_validate_token", return_value={"sub": "user123"}):
+        with patch.object(view, "_authenticate", return_value=CALLER):
             response = await view.post(request)
         assert response.status == 200
         text = json.loads(response.body)["result"]["content"][0]["text"]
@@ -253,7 +262,7 @@ class TestToolsConfigFlows:
 
         text, data = await self._call(view, "configure_config_flow", {"flow_id": "f"})
 
-        assert data["description_placeholders"] == {"url": "http://host:80/p"}
+        assert data["description_placeholders"] == {"url": "http://<redacted>@host:80/p"}
         assert SECRET not in text
 
     @pytest.mark.parametrize("source", ["reauth", "reconfigure"])
@@ -270,6 +279,52 @@ class TestToolsConfigFlows:
         assert source in aborted["error"]
         mock_hass.config_entries.flow.async_configure.assert_not_awaited()
         mock_hass.config_entries.flow.async_abort.assert_not_called()
+
+    async def test_non_admin_is_refused_before_any_flow_runs(self, mock_hass):
+        """The new tools sit behind the same administrator gate as every other tool."""
+        mock_hass.data = {"mcp_server_http_transport": {"entry_id": Mock()}}
+        mock_hass.auth.async_get_user = AsyncMock(
+            return_value=Mock(id="user123", is_admin=False, is_active=True)
+        )
+        mock_hass.config_entries.flow.async_init = AsyncMock()
+        view = MCPEndpointView(mock_hass)
+        request = Mock(path="/api/mcp_http")
+        request.headers = {"Authorization": "Bearer t"}
+        request.json = AsyncMock(
+            return_value={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "start_config_flow", "arguments": {"domain": "x"}},
+                "id": 1,
+            }
+        )
+
+        with patch.object(
+            view, "_validate_token", return_value=ValidatedToken("user123", AUTH_METHOD_NATIVE)
+        ):
+            response = await view.post(request)
+
+        assert response.status == 403
+        mock_hass.config_entries.flow.async_init.assert_not_awaited()
+
+    async def test_configure_is_audited_with_masked_input(self, view, mock_hass):
+        """A mutating call is fired as an audit event; secret-named input is masked."""
+        mock_hass.config_entries.flow.async_configure = AsyncMock(
+            return_value={"type": FlowResultType.ABORT, "reason": "x"}
+        )
+
+        await self._call(
+            view,
+            "configure_config_flow",
+            {"flow_id": "f1", "user_input": {"host": "h", "password": SECRET}},
+        )
+
+        event, payload = mock_hass.bus.async_fire.call_args.args
+        assert event == EVENT_TOOL_CALLED
+        assert payload["tool"] == "configure_config_flow"
+        assert payload["user_id"] == "user123"
+        assert payload["arguments"]["user_input"] == {"host": "h", "password": "***"}
+        assert SECRET not in json.dumps(payload)
 
     def test_abort_is_marked_destructive(self):
         assert TOOLS["abort_config_flow"]["schema"]["annotations"]["destructiveHint"] is True

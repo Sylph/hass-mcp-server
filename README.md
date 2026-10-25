@@ -297,7 +297,7 @@ been copied and source identity/metadata checked for changes during copying.
 | `abort_config_flow` | Abort and discard an unfinished setup flow |
 | `list_config_flows_in_progress` | List setup flows that are started or discovered but not finished |
 
-Setup-flow results never echo secret-looking fields (names containing `password`, `token`, `key`, `secret`, `credential` or `auth`): their defaults and suggested values are masked, and the created entry's data is not returned. Like every tool here, they run with the full rights of the token that authenticated the request.
+Setup-flow results never echo secret-looking fields (names containing `password`, `token`, `key`, `secret`, `credential` or `auth`): their defaults and suggested values are masked, and the created entry's data is not returned. Like every tool here, they require a Home Assistant administrator and are audited with the caller's identity (the arguments are masked in the audit log).
 
 **KNX**
 
