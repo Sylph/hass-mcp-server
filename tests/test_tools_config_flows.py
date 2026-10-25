@@ -308,7 +308,7 @@ class TestToolsConfigFlows:
         mock_hass.config_entries.flow.async_init.assert_not_awaited()
 
     async def test_configure_is_audited_with_masked_input(self, view, mock_hass):
-        """A mutating call is fired as an audit event; secret-named input is masked."""
+        """A mutating call is fired as an audit event; every submitted value is masked."""
         mock_hass.config_entries.flow.async_configure = AsyncMock(
             return_value={"type": FlowResultType.ABORT, "reason": "x"}
         )
@@ -323,8 +323,29 @@ class TestToolsConfigFlows:
         assert event == EVENT_TOOL_CALLED
         assert payload["tool"] == "configure_config_flow"
         assert payload["user_id"] == "user123"
-        assert payload["arguments"]["user_input"] == {"host": "h", "password": "***"}
+        assert payload["arguments"]["user_input"] == {"host": "***", "password": "***"}
         assert SECRET not in json.dumps(payload)
+
+    async def test_audit_never_shows_user_input_values(self, view, mock_hass, caplog):
+        """Field names cannot reveal every secret, so no submitted value is audited."""
+        mock_hass.config_entries.flow.async_configure = AsyncMock(
+            return_value={"type": FlowResultType.ABORT, "reason": "x"}
+        )
+        values = {
+            "access_key": "AKIA-access-key-value",
+            "otp": "482913-otp-value",
+            "url": "http://user:userinfo-secret@host/path",
+        }
+
+        with caplog.at_level("INFO"):
+            await self._call(view, "configure_config_flow", {"flow_id": "f1", "user_input": values})
+
+        event, payload = mock_hass.bus.async_fire.call_args.args
+        assert payload["arguments"]["user_input"] == dict.fromkeys(values, "***")
+        audited = json.dumps(payload) + caplog.text
+        for value in ("AKIA-access-key-value", "482913-otp-value", "userinfo-secret"):
+            assert value not in audited
+        assert "access_key" in caplog.text
 
     def test_abort_is_marked_destructive(self):
         assert TOOLS["abort_config_flow"]["schema"]["annotations"]["destructiveHint"] is True

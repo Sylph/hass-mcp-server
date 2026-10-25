@@ -57,8 +57,13 @@ def register_tool(
     description: str,
     input_schema: dict[str, Any],
     annotations: dict[str, Any] | None = None,
+    redact_arguments: tuple[str, ...] = (),
 ):
-    """Decorator to register a tool with its schema and handler."""
+    """Decorator to register a tool with its schema and handler.
+
+    ``redact_arguments`` names arguments whose values the audit log never shows,
+    for input whose secrets cannot be recognised by field name.
+    """
 
     def decorator(func):
         schema = {
@@ -72,6 +77,7 @@ def register_tool(
         TOOLS[name] = {
             "schema": schema,
             "handler": func,
+            "redact_arguments": redact_arguments,
         }
         return func
 

@@ -197,6 +197,7 @@ async def start_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) -> d
         "required": ["flow_id"],
     },
     annotations=_ANNOTATION_OPEN_WORLD,
+    redact_arguments=("user_input",),
 )
 async def configure_config_flow(hass: HomeAssistant, arguments: dict[str, Any]) -> dict[str, Any]:
     """Submit user input to an in-progress config flow."""

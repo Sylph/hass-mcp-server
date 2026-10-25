@@ -105,6 +105,30 @@ def _is_secret_key(key: Any) -> bool:
     return any(fragment in lowered for fragment in _SECRET_KEY_FRAGMENTS)
 
 
+def _redact_values(name: Any, arguments: Any) -> Any:
+    """Blank every value under the arguments a tool lists as ``redact_arguments``.
+
+    Keys stay, so the audit still shows which fields were submitted. A form's
+    fields are named by whichever integration owns it, so name matching alone
+    cannot be trusted to find a secret in them.
+    """
+    tool = TOOLS.get(name) if isinstance(name, str) else None
+    if tool is None or not isinstance(arguments, dict):
+        return arguments
+
+    def blank(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: blank(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [blank(item) for item in value]
+        return SECRET_MASK
+
+    return {
+        key: blank(value) if key in tool.get("redact_arguments", ()) else value
+        for key, value in arguments.items()
+    }
+
+
 def mask_secrets(value: Any) -> Any:
     """Return a copy of ``value`` with the value of every secret-named key masked.
 
@@ -805,7 +829,7 @@ class MCPEndpointView(HomeAssistantView):
         # text and is logged as a JSON string so a newline in it cannot forge a
         # log line.
         logged_tool = tool if tool in TOOLS else dumps(tool)
-        summary = truncate_arguments(mask_secrets(arguments))
+        summary = truncate_arguments(mask_secrets(_redact_values(name, arguments)))
         _LOGGER.log(
             level,
             "MCP tool call by user %s (%s auth): %s -> %s, arguments %s",
